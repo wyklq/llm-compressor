@@ -41,7 +41,7 @@ ds = ds.map(preprocess)
 # full_attention_interval=4 (full_attention at layers 3,7,11,...).
 recipe = [
     AWQModifier(
-        ignore=["lm_head"],
+        ignore=["lm_head", "re:.*linear_attn\\.in_proj_b$", "re:.*linear_attn\\.in_proj_a$"],
         scheme="W4A16",
         targets=["Linear"],
     ),

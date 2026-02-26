@@ -110,8 +110,6 @@ _qwen3_5_mappings = [
         [
             "re:.*linear_attn.in_proj_qkv$",
             "re:.*linear_attn.in_proj_z$",
-            "re:.*linear_attn.in_proj_b$",
-            "re:.*linear_attn.in_proj_a$",
         ],
     ),
     AWQMapping(
