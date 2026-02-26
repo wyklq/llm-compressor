@@ -1,4 +1,7 @@
-"""Tests for llmcompressor.utils.dev (skip_weights_initialize, TORCH_INIT_FUNCTIONS import)."""
+"""
+Tests for llmcompressor.utils.dev(skip_weights_initialize, TORCH_INIT_FUNCTIONS import).
+
+"""
 
 import pytest
 import torch
