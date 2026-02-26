@@ -36,10 +36,13 @@ except Exception as _err:
 
 
 try:
-    from transformers.modeling_utils import Conv1D as TransformerConv1D
-except Exception as _err:
-    gpt_conv1d_err = _err
-    TransformerConv1D = None
+    from transformers.pytorch_utils import Conv1D as TransformerConv1D
+except Exception:
+    try:
+        from transformers.modeling_utils import Conv1D as TransformerConv1D
+    except Exception as _err:
+        gpt_conv1d_err = _err
+        TransformerConv1D = None
 
 
 __all__ = [
@@ -337,7 +340,11 @@ def get_no_split_params(model: PreTrainedModel) -> Union[str, List[str]]:
 
     :return: list of class names that shouldn't be split
     """
-    no_split_modules = model._get_no_split_modules("auto")
+    if hasattr(model, "_get_no_split_modules"):
+        no_split_modules = model._get_no_split_modules("auto")
+    else:
+        no_split_modules = getattr(model, "_no_split_modules", None) or []
+
     if len(no_split_modules) <= 0:
         return ALL_TARGET
 

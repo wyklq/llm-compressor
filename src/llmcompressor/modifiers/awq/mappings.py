@@ -94,6 +94,40 @@ _qwen3_next_moe_mappings = [
     AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
 ]
 
+# Qwen3.5 is a dense model (no MoE) with hybrid attention: full_attention at
+# layers 3,7,11,... (default full_attention_interval=4) and linear_attention
+# (GatedDeltaNet) at all other layers. Qwen3.5 uses separate in_proj_qkv, in_proj_z,
+# in_proj_b, in_proj_a (unlike Qwen3Next's fused in_proj_qkvz and in_proj_ba).
+# Include layer indices up to 63 to support 64-layer models (e.g. 27B).
+_qwen3_5_mappings = [
+    AWQMapping(
+        "re:.*layers\\.(3|7|11|15|19|23|27|31|35|39|43|47|51|55|59|63)\\.input_layernorm$",
+        ["re:.*self_attn.q_proj$", "re:.*self_attn.k_proj$", "re:.*self_attn.v_proj$"],
+    ),
+    AWQMapping("re:.*self_attn.v_proj$", ["re:.*self_attn.o_proj$"]),
+    AWQMapping(
+        "re:.*layers\\.(0|1|2|4|5|6|8|9|10|12|13|14|16|17|18|20|21|22|24|25|26|28|29|30|32|33|34|36|37|38|40|41|42|44|45|46|48|49|50|52|53|54|56|57|58|60|61|62)\\.input_layernorm$",
+        [
+            "re:.*linear_attn.in_proj_qkv$",
+            "re:.*linear_attn.in_proj_z$",
+            "re:.*linear_attn.in_proj_b$",
+            "re:.*linear_attn.in_proj_a$",
+        ],
+    ),
+    AWQMapping(
+        "re:.*linear_attn.in_proj_qkv$",
+        ["re:.*linear_attn.out_proj$"],
+    ),
+    AWQMapping(
+        "re:.*post_attention_layernorm$",
+        ["re:.*gate_proj$", "re:.*up_proj$"],
+    ),
+    AWQMapping(
+        "re:.*up_proj$",
+        ["re:.*down_proj$"],
+    ),
+]
+
 # Phi merges
 #  q, k, and v proj layers into a single qkv_proj layer
 #  gate and up proj layers into a single gate_up_proj layer
@@ -262,6 +296,7 @@ AWQ_MAPPING_REGISTRY: dict[str, list[AWQMapping]] = {
     "Qwen2_5OmniThinkerForConditionalGeneration": _default_mappings,
     "Qwen2MoeForCausalLM": _moe_default_mappings,
     "Qwen3ForCausalLM": _default_mappings,
+    "Qwen3_5ForCausalLM": _qwen3_5_mappings,
     "Qwen3MoeForCausalLM": _moe_default_mappings,
     "Qwen3NextForCausalLM": _qwen3_next_moe_mappings,
     "Glm4MoeForCausalLM": _default_mappings,
