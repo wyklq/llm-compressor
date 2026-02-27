@@ -39,9 +39,21 @@ ds = ds.map(preprocess)
 # Configure the quantization algorithm to run.
 # Qwen3.5-27B is dense with hybrid attention; AWQ mappings use default
 # full_attention_interval=4 (full_attention at layers 3,7,11,...).
+# Exclude: first layer (quantization-sensitive), self_attn q/k/v_proj (GQA dimensions),
+# linear_attn in_proj_b/a (out_features=48, not divisible by group_size=128),
+# and MTP heads.
 recipe = [
     AWQModifier(
-        ignore=["lm_head", "re:.*linear_attn\\.in_proj_b$", "re:.*linear_attn\\.in_proj_a$"],
+        ignore=[
+            "lm_head",
+            "re:model\\.layers\\.0\\.",
+            "re:.*self_attn\\.q_proj$",
+            "re:.*self_attn\\.k_proj$",
+            "re:.*self_attn\\.v_proj$",
+            "re:.*linear_attn\\.in_proj_b$",
+            "re:.*linear_attn\\.in_proj_a$",
+            "re:.*mtp.*",
+        ],
         scheme="W4A16",
         targets=["Linear"],
     ),
