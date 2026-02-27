@@ -20,6 +20,13 @@ Within every group of 8 output values the packed int32 stores them as
     packed = v[0] | v[2]<<4 | v[4]<<8 | v[6]<<12
            | v[1]<<16 | v[3]<<20 | v[5]<<24 | v[7]<<28
 
+Symmetric quantization note
+----------------------------
+compressed-tensors uses uint4b8 for symmetric: stored values 0-15 with an
+implicit bias of -8.  AWQ Marlin only supports uint4 (with explicit zero
+points), so we set zero_point=true and fill qzeros with 8 to achieve the
+same dequantization: float = (val - 8) * scale.
+
 Usage
 -----
     python convert_ct_to_awq.py <compressed-tensors-model-dir> <output-dir>
@@ -30,6 +37,7 @@ Then:
 
 import argparse
 import json
+import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
@@ -41,6 +49,7 @@ from safetensors.torch import save_file
 AWQ_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]
 BITS = 4
 PACK_FACTOR = 32 // BITS  # 8
+SYMMETRIC_ZP_VALUE = 8  # uint4b8 midpoint bias
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -72,6 +81,23 @@ def _apply_awq_interleave(t: torch.Tensor, dim: int) -> torch.Tensor:
     return t.index_select(dim, idx)
 
 
+def _make_symmetric_qzeros(num_groups: int, out_features: int) -> torch.Tensor:
+    """Create qzeros filled with SYMMETRIC_ZP_VALUE=8 in AWQ packed format.
+
+    All 8 nibbles in each int32 are the same value (8), so the AWQ
+    interleave is a no-op.  0x88888888 as signed int32 = -2004318072.
+    """
+    packed_val = 0
+    for i in range(PACK_FACTOR):
+        packed_val |= SYMMETRIC_ZP_VALUE << (i * BITS)
+    # packed_val = 0x88888888; as signed int32 wraps to negative
+    return torch.full(
+        (num_groups, out_features // PACK_FACTOR),
+        packed_val,
+        dtype=torch.int32,
+    )
+
+
 # ── per-layer conversion ────────────────────────────────────────────────────
 
 
@@ -94,6 +120,47 @@ def _convert_zeros(weight_zp: torch.Tensor) -> torch.Tensor:
     zp = zp.t().contiguous()                    # [groups, out]
     zp = _apply_awq_interleave(zp, dim=1)
     return _pack_int4(zp, pack_dim=1)           # [groups, out//8]
+
+
+# ── config helpers ───────────────────────────────────────────────────────────
+
+
+def _find_ct_qcfg(config: dict) -> tuple[dict, str]:
+    """Locate the compressed-tensors quantization_config.
+
+    For VLMs (e.g. Qwen3_5ForConditionalGeneration) it lives inside
+    text_config; for pure text models it's at the top level.
+    Returns (ct_qcfg_dict, location) where location is 'top' or 'text_config'.
+    """
+    top = config.get("quantization_config", {})
+    if top.get("quant_method") == "compressed-tensors":
+        return top, "top"
+
+    tc = config.get("text_config", {})
+    nested = tc.get("quantization_config", {})
+    if nested.get("quant_method") == "compressed-tensors":
+        return nested, "text_config"
+
+    return top if top else nested, "top"
+
+
+def _build_modules_to_not_convert(ignore_list: list[str]) -> list[str]:
+    """Convert compressed-tensors ignore list to AWQ modules_to_not_convert.
+
+    AWQ uses substring matching (skip_with_substr=True), so we convert
+    regex patterns like ``re:visual.*`` to plain substrings like ``visual``.
+    """
+    result = []
+    for entry in ignore_list:
+        if entry.startswith("re:"):
+            pattern = entry[3:]
+            # Extract the fixed prefix before any regex metacharacters
+            m = re.match(r"^([A-Za-z0-9_.]+)", pattern)
+            if m:
+                result.append(m.group(1))
+        else:
+            result.append(entry)
+    return result
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -122,19 +189,28 @@ def convert_model(src: str, dst: str):
     with open(src_path / "config.json") as f:
         config = json.load(f)
 
-    ct_qcfg = config.get("quantization_config", {})
+    ct_qcfg, ct_location = _find_ct_qcfg(config)
     config_groups = ct_qcfg.get("config_groups", {})
-    group_size, zero_point, bits = 128, True, 4
+
+    group_size, symmetric, bits = 128, True, 4
     for _, grp in config_groups.items():
         wcfg = grp.get("weights", {})
         if wcfg:
             group_size = wcfg.get("group_size", 128)
-            zero_point = not wcfg.get("symmetric", True)
+            symmetric = wcfg.get("symmetric", True)
             bits = wcfg.get("num_bits", 4)
             break
 
+    # awq_marlin only supports uint4 (has_zp=True).  For symmetric
+    # quantization we set zero_point=True with qzeros = 8 (see docstring).
+    zero_point = True
+
     ignore_list = ct_qcfg.get("ignore", [])
-    modules_to_not_convert = [m for m in ignore_list if not m.startswith("re:")]
+    modules_to_not_convert = _build_modules_to_not_convert(ignore_list)
+
+    print(f"Source config location: {ct_location}")
+    print(f"  bits={bits}  group_size={group_size}  symmetric={symmetric}")
+    print(f"  modules_to_not_convert ({len(modules_to_not_convert)} entries)")
 
     # ── process safetensors shards ──────────────────────────────────────
     st_files = sorted(src_path.glob("*.safetensors"))
@@ -168,8 +244,12 @@ def convert_model(src: str, dst: str):
 
             qweight = _convert_weight(wp)
             scales = _convert_scales(ws)
+
             if wz is not None:
                 qzeros = _convert_zeros(wz)
+            elif symmetric:
+                num_groups, out_features = scales.shape
+                qzeros = _make_symmetric_qzeros(num_groups, out_features)
             else:
                 num_groups, out_features = scales.shape
                 qzeros = torch.zeros(
@@ -195,21 +275,30 @@ def convert_model(src: str, dst: str):
         with open(dst_path / "model.safetensors.index.json", "w") as f:
             json.dump(idx, f, indent=2)
 
-    # ── config.json (replace quantization_config) ───────────────────────
+    # ── AWQ quantization config ─────────────────────────────────────────
     awq_qcfg = {
         "quant_method": "awq",
         "bits": bits,
         "group_size": group_size,
         "zero_point": zero_point,
         "version": "gemm",
+        "modules_to_not_convert": modules_to_not_convert,
     }
-    if modules_to_not_convert:
-        awq_qcfg["modules_to_not_convert"] = modules_to_not_convert
 
-    new_config = {k: v for k, v in config.items() if k != "quantization_config"}
+    # ── config.json ─────────────────────────────────────────────────────
+    # Remove CT quantization_config from wherever it was, put AWQ at top level.
+    new_config = dict(config)
+    new_config.pop("quantization_config", None)
+
+    if "text_config" in new_config:
+        tc = dict(new_config["text_config"])
+        tc.pop("quantization_config", None)
+        new_config["text_config"] = tc
+
     new_config["quantization_config"] = awq_qcfg
+
     with open(dst_path / "config.json", "w") as f:
-        json.dump(new_config, f, indent=2)
+        json.dump(new_config, f, indent=2, ensure_ascii=False)
 
     # ── quantize_config.json (vLLM also reads this) ─────────────────────
     with open(dst_path / "quantize_config.json", "w") as f:
