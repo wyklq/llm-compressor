@@ -1,3 +1,4 @@
+import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -5,9 +6,10 @@ from llmcompressor import oneshot
 from llmcompressor.modifiers.awq import AWQModifier
 
 # Select model and load it.
+# Use float16 (not "auto"/bfloat16) so that Marlin kernels work on A100.
 MODEL_ID = "Qwen/Qwen3.5-27B"
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
 # Select calibration dataset.
