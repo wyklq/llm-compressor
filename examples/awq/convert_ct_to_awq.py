@@ -140,6 +140,40 @@ def _find_ct_qcfg(config: dict) -> tuple[dict, str]:
     return top if top else nested, "top"
 
 
+def _regex_to_literal(pattern: str) -> str | None:
+    """Extract a usable literal substring from a compressed-tensors regex.
+
+    Handles common patterns produced by llmcompressor's ignore list:
+      ``model\\.layers\\.0\\.``  →  ``model.layers.0.``
+      ``.*self_attn\\.q_proj$``  →  ``self_attn.q_proj``
+      ``.*mtp.*``                →  ``mtp``
+    """
+    pattern = pattern.rstrip("$")
+
+    # Strip leading/trailing greedy wildcards (.*  .+)
+    pattern = re.sub(r"^(\.\*|\.\+)+", "", pattern)
+    pattern = re.sub(r"(\.\*|\.\+)+$", "", pattern)
+
+    literal: list[str] = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern):
+            nxt = pattern[i + 1]
+            if nxt in r"\.[](){}*+?|^$":
+                literal.append(nxt)
+                i += 2
+                continue
+            break  # \d, \w, etc. – not a plain literal
+        if c in r".*+?[](){}|^$":
+            break  # unescaped metacharacter
+        literal.append(c)
+        i += 1
+
+    s = "".join(literal)
+    return s if s else None
+
+
 def _build_modules_to_not_convert(ignore_list: list[str]) -> list[str]:
     """Convert compressed-tensors ignore list to AWQ modules_to_not_convert.
 
@@ -149,11 +183,9 @@ def _build_modules_to_not_convert(ignore_list: list[str]) -> list[str]:
     result = []
     for entry in ignore_list:
         if entry.startswith("re:"):
-            pattern = entry[3:]
-            # Extract the fixed prefix before any regex metacharacters
-            m = re.match(r"^([A-Za-z0-9_.]+)", pattern)
-            if m:
-                result.append(m.group(1))
+            lit = _regex_to_literal(entry[3:])
+            if lit:
+                result.append(lit)
         else:
             result.append(entry)
     return result
@@ -206,7 +238,9 @@ def convert_model(src: str, dst: str):
 
     print(f"Source config location: {ct_location}")
     print(f"  bits={bits}  group_size={group_size}  symmetric={symmetric}")
-    print(f"  modules_to_not_convert ({len(modules_to_not_convert)} entries)")
+    print(f"  modules_to_not_convert ({len(modules_to_not_convert)} entries):")
+    for m in modules_to_not_convert:
+        print(f"    - {m!r}")
 
     # ── process safetensors shards ──────────────────────────────────────
     st_files = sorted(src_path.glob("*.safetensors"))
@@ -261,6 +295,37 @@ def convert_model(src: str, dst: str):
             weight_map[k] = st_file.name
 
         print(f"  converted {st_file.name}  ({len(new_tensors)} tensors)")
+
+    # ── auto-detect unquantized linear layers ──────────────────────────
+    quantized_prefixes = set()
+    unquantized_weight_keys = set()
+    for k in weight_map:
+        if k.endswith(".qweight"):
+            quantized_prefixes.add(k[: -len(".qweight")])
+        elif k.endswith(".weight"):
+            unquantized_weight_keys.add(k)
+
+    auto_added = []
+    for wkey in sorted(unquantized_weight_keys):
+        prefix = wkey[: -len(".weight")]
+        if prefix in quantized_prefixes:
+            continue
+        # Skip non-linear parameters (embeddings, norms, biases, etc.)
+        if any(
+            seg in prefix.rsplit(".", 1)[-1]
+            for seg in ("embed", "norm", "layernorm", "head")
+        ):
+            continue
+        # Check if already covered by existing modules_to_not_convert
+        if any(m in prefix for m in modules_to_not_convert):
+            continue
+        modules_to_not_convert.append(prefix)
+        auto_added.append(prefix)
+
+    if auto_added:
+        print(f"  auto-detected {len(auto_added)} unquantized linear layers:")
+        for m in auto_added:
+            print(f"    + {m!r}")
 
     # ── safetensors index ───────────────────────────────────────────────
     idx_file = src_path / "model.safetensors.index.json"
