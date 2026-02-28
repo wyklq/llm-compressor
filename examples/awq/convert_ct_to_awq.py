@@ -87,15 +87,11 @@ def _make_symmetric_qzeros(num_groups: int, out_features: int) -> torch.Tensor:
     All 8 nibbles in each int32 are the same value (8), so the AWQ
     interleave is a no-op.  0x88888888 as signed int32 = -2004318072.
     """
-    packed_val = 0
+    # Build one packed int32 with 8 nibbles each set to 8, then broadcast.
+    single = torch.zeros(1, dtype=torch.int32)
     for i in range(PACK_FACTOR):
-        packed_val |= SYMMETRIC_ZP_VALUE << (i * BITS)
-    # packed_val = 0x88888888; as signed int32 wraps to negative
-    return torch.full(
-        (num_groups, out_features // PACK_FACTOR),
-        packed_val,
-        dtype=torch.int32,
-    )
+        single |= SYMMETRIC_ZP_VALUE << (i * BITS)
+    return single.expand(num_groups, out_features // PACK_FACTOR).contiguous()
 
 
 # ── per-layer conversion ────────────────────────────────────────────────────
