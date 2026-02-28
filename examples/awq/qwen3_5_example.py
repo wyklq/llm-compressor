@@ -77,23 +77,27 @@ def data_collator(batch):
 # Qwen3.5-27B is dense with hybrid attention; AWQ mappings use
 # full_attention_interval=4 (full_attention at layers 3,7,11,...).
 #
-# Ignore list:
+# Ignore list (refers QuantTrio/Qwen3.5-27B-AWQ for vLLM compat):
 #   - lm_head: output head, not quantized
-#   - model.layers.0: first decoder layer (quantization-sensitive)
-#   - model.visual: vision encoder (not quantized)
+#   - layers.0: first decoder layer (quantization-sensitive).
+#     NOTE: use "re:.*layers\\.0\\." (not "re:model\\.layers\\.0\\.")
+#     because the VLM wrapper adds a "language_model" prefix.
+#   - model.visual / visual: vision encoder (not quantized)
 #   - linear_attn.in_proj_b/a: out_features=48, not divisible by group_size=128
+#   - self_attn q/k/v: vLLM merges these into a packed QKV tensor via
+#     QKVParallelLinear; quantized q/k/v are incompatible with the AWQ
+#     Marlin kernel's merge path.  Keep fp16.
 #   - mtp: multi-token prediction heads (not quantized)
-#
-# NOTE: self_attn q/k/v projections are NOT excluded -- their dimensions are
-# divisible by group_size=128. Full AWQ smoothing is applied to both self_attn
-# and linear_attn layers via the mapping registry.
 recipe = [
     AWQModifier(
         ignore=[
             "lm_head",
-            "re:model\\.layers\\.0\\.",
+            "re:.*layers\\.0\\.",
             "re:.*linear_attn\\.in_proj_b$",
             "re:.*linear_attn\\.in_proj_a$",
+            "re:.*self_attn\\.q_proj$",
+            "re:.*self_attn\\.k_proj$",
+            "re:.*self_attn\\.v_proj$",
             "re:.*mtp.*",
             "re:model[.]visual.*",
             "re:visual.*",

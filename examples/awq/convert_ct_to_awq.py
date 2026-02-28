@@ -177,17 +177,79 @@ def _regex_to_literal(pattern: str) -> str | None:
 def _build_modules_to_not_convert(ignore_list: list[str]) -> list[str]:
     """Convert compressed-tensors ignore list to AWQ modules_to_not_convert.
 
-    AWQ uses substring matching (skip_with_substr=True), so we convert
-    regex patterns like ``re:visual.*`` to plain substrings like ``visual``.
+    AWQ / vLLM use substring matching, so we:
+      1. Convert regex patterns (``re:visual.*``) to literal substrings.
+      2. Collapse per-layer entries that share a common suffix into a single
+         short substring (e.g. 48 entries for ``layers.*.linear_attn.in_proj_b``
+         become the single entry ``linear_attn.in_proj_b``).
+
+    This produces a compact list that matches vLLM's internal module names
+    regardless of any ``language_model`` prefix differences.
     """
-    result = []
+    literals: list[str] = []
     for entry in ignore_list:
         if entry.startswith("re:"):
             lit = _regex_to_literal(entry[3:])
             if lit:
-                result.append(lit)
+                literals.append(lit)
         else:
+            literals.append(entry)
+
+    # Collapse repeated per-layer entries into common suffixes.
+    # E.g. model.language_model.layers.0.linear_attn.in_proj_b,
+    #      model.language_model.layers.1.linear_attn.in_proj_b, ...
+    # → linear_attn.in_proj_b
+    #
+    # Suffixes that appear in only ONE layer (typically layer-0 exclusion)
+    # are collapsed into a single "layers.0." entry to avoid incorrectly
+    # marking the same suffix in other layers as unquantized.
+    #
+    # Also collapse visual block entries into a single "visual" substring.
+    layer_re = re.compile(r"^(.*\.layers)\.(\d+)\.(.*)")
+    suffix_layers: dict[str, set[str]] = {}
+    non_layer: list[str] = []
+    has_visual = False
+    for entry in literals:
+        if "visual" in entry:
+            has_visual = True
+            continue
+        m = layer_re.match(entry)
+        if m:
+            layer_idx = m.group(2)
+            suffix = m.group(3)
+            suffix_layers.setdefault(suffix, set()).add(layer_idx)
+        else:
+            non_layer.append(entry)
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    if has_visual:
+        result.append("visual")
+        seen.add("visual")
+
+    for entry in non_layer:
+        if entry not in seen:
+            seen.add(entry)
             result.append(entry)
+
+    # Suffixes appearing in multiple layers → global substring
+    # Suffixes appearing in only one layer → "layers.N." prefix
+    single_layer_ids: set[str] = set()
+    for suffix, layer_ids in sorted(suffix_layers.items()):
+        if len(layer_ids) > 1:
+            if suffix not in seen:
+                seen.add(suffix)
+                result.append(suffix)
+        else:
+            single_layer_ids.update(layer_ids)
+
+    for lid in sorted(single_layer_ids, key=int):
+        entry = f"layers.{lid}."
+        if entry not in seen:
+            seen.add(entry)
+            result.append(entry)
+
     return result
 
 
