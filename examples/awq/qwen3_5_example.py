@@ -1,58 +1,98 @@
+import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.awq import AWQModifier
 
 # Select model and load it.
+# IMPORTANT: Load with the VLM class (Qwen3_5ForConditionalGeneration), NOT
+# AutoModelForCausalLM. This preserves the multimodal config (model_type: "qwen3_5")
+# and the correct weight prefix (model.language_model.layers.*) so that the
+# quantized model can be loaded again as a VLM without empty output issues.
 MODEL_ID = "Qwen/Qwen3.5-27B"
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    MODEL_ID, torch_dtype="auto", device_map=None
+)
+processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
 
 # Select calibration dataset.
-DATASET_ID = "HuggingFaceH4/ultrachat_200k"
-DATASET_SPLIT = "train_sft"
+DATASET_ID = "neuralmagic/calibration"
+DATASET_SPLIT = "train"
 
 # Select number of samples. 256 samples is a good place to start.
 # Increasing the number of samples can improve accuracy.
 NUM_CALIBRATION_SAMPLES = 256
-MAX_SEQUENCE_LENGTH = 512
+MAX_SEQUENCE_LENGTH = 2048
 
 # Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
+ds = load_dataset(DATASET_ID, name="LLM", split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
 ds = ds.shuffle(seed=42)
 
 
 def preprocess(example):
-    return {
-        "text": tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
+    messages = []
+    for message in example["messages"]:
+        messages.append(
+            {
+                "role": message["role"],
+                "content": [{"type": "text", "text": message["content"]}],
+            }
         )
+
+    return processor.apply_chat_template(
+        messages,
+        return_tensors="pt",
+        padding=False,
+        truncation=True,
+        max_length=MAX_SEQUENCE_LENGTH,
+        tokenize=True,
+        add_special_tokens=False,
+        return_dict=True,
+        add_generation_prompt=False,
+    )
+
+
+ds = ds.map(preprocess, batched=False, remove_columns=ds.column_names)
+
+
+def data_collator(batch):
+    assert len(batch) == 1
+    return {
+        key: (
+            torch.tensor(value)
+            if key != "pixel_values"
+            else torch.tensor(value, dtype=torch.bfloat16).squeeze(0)
+        )
+        for key, value in batch[0].items()
     }
 
 
-ds = ds.map(preprocess)
-
-
 # Configure the quantization algorithm to run.
-# Qwen3.5-27B is dense with hybrid attention; AWQ mappings use default
+# Qwen3.5-27B is dense with hybrid attention; AWQ mappings use
 # full_attention_interval=4 (full_attention at layers 3,7,11,...).
-# Exclude: first layer (quantization-sensitive), self_attn q/k/v_proj (GQA dimensions),
-# linear_attn in_proj_b/a (out_features=48, not divisible by group_size=128),
-# and MTP heads.
+#
+# Ignore list:
+#   - lm_head: output head, not quantized
+#   - model.layers.0: first decoder layer (quantization-sensitive)
+#   - model.visual: vision encoder (not quantized)
+#   - linear_attn.in_proj_b/a: out_features=48, not divisible by group_size=128
+#   - mtp: multi-token prediction heads (not quantized)
+#
+# NOTE: self_attn q/k/v projections are NOT excluded -- their dimensions are
+# divisible by group_size=128. Full AWQ smoothing is applied to both self_attn
+# and linear_attn layers via the mapping registry.
 recipe = [
     AWQModifier(
         ignore=[
             "lm_head",
             "re:model\\.layers\\.0\\.",
-            "re:.*self_attn\\.q_proj$",
-            "re:.*self_attn\\.k_proj$",
-            "re:.*self_attn\\.v_proj$",
             "re:.*linear_attn\\.in_proj_b$",
             "re:.*linear_attn\\.in_proj_a$",
             "re:.*mtp.*",
+            "re:model[.]visual.*",
+            "re:visual.*",
         ],
         scheme="W4A16",
         targets=["Linear"],
@@ -62,13 +102,27 @@ recipe = [
 # Apply algorithms.
 oneshot(
     model=model,
+    processor=processor,
     dataset=ds,
     recipe=recipe,
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+    data_collator=data_collator,
 )
 
 # Save to disk compressed.
 SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-awq"
 model.save_pretrained(SAVE_DIR, save_compressed=True)
-tokenizer.save_pretrained(SAVE_DIR)
+processor.save_pretrained(SAVE_DIR)
+
+# ── Post-processing for awq-marlin kernel compatibility ──
+# The model is saved in compressed-tensors format (quant_method: "compressed-tensors").
+# For vLLM to auto-detect awq_marlin kernel, convert to standard AWQ format:
+#
+#   python convert_ct_to_awq.py <SAVE_DIR> <SAVE_DIR>-awq-marlin
+#
+# This converts:
+#   - weight_packed/weight_scale/weight_zero_point → qweight/scales/qzeros
+#   - quant_method: "compressed-tensors" → quant_method: "awq"
+#   - Applies AWQ interleave packing order
+
