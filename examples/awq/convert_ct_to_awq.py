@@ -375,6 +375,26 @@ def convert_model(src: str, dst: str):
         if p.is_file() and p.name not in skip:
             shutil.copy2(p, dst_path / p.name)
 
+    # ── tokenizer sanity check ───────────────────────────────────────────
+    tok_cfg_path = dst_path / "tokenizer_config.json"
+    if tok_cfg_path.exists():
+        with open(tok_cfg_path) as f:
+            tok_cfg = json.load(f)
+        tok_cls = tok_cfg.get("tokenizer_class", "")
+        if tok_cls == "TokenizersBackend":
+            print(
+                "\n⚠ WARNING: tokenizer_config.json has "
+                'tokenizer_class="TokenizersBackend" (transformers 5.x default).'
+                "\n  vLLM may produce garbled output.  Replace the tokenizer "
+                "files with the originals from the source model:\n"
+                "    tokenizer_config.json, tokenizer.json, vocab.json, merges.txt"
+            )
+        if not (dst_path / "vocab.json").exists():
+            print(
+                "\n⚠ WARNING: vocab.json not found.  Some inference engines "
+                "need it for the slow tokenizer fallback."
+            )
+
     print(f"\nDone.  AWQ model saved to {dst_path}")
     print(f"quantize_config: {json.dumps(awq_qcfg, indent=2)}")
     print(

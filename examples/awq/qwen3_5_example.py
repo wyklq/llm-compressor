@@ -1,5 +1,9 @@
+import os
+import shutil
+
 import torch
 from datasets import load_dataset
+from huggingface_hub import hf_hub_download
 from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
 from llmcompressor import oneshot
@@ -114,6 +118,26 @@ oneshot(
 SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-awq"
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 processor.save_pretrained(SAVE_DIR)
+
+# ── Fix tokenizer for inference compatibility ──
+# processor.save_pretrained() with transformers 5.x writes
+# tokenizer_class="TokenizersBackend" and omits added_tokens_decoder,
+# vocab.json, and merges.txt.  vLLM and older transformers expect the
+# original Qwen2Tokenizer class and the full set of tokenizer files.
+# Copy the originals from the HF hub cache to ensure correct byte-level
+# BPE decoding at inference time.
+_TOKENIZER_FILES = [
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "vocab.json",
+    "merges.txt",
+]
+for _fname in _TOKENIZER_FILES:
+    try:
+        _cached = hf_hub_download(repo_id=MODEL_ID, filename=_fname)
+        shutil.copy2(_cached, os.path.join(SAVE_DIR, _fname))
+    except Exception:
+        pass
 
 # ── Post-processing for awq-marlin kernel compatibility ──
 # The model is saved in compressed-tensors format (quant_method: "compressed-tensors").
